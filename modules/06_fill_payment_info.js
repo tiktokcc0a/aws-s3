@@ -1,16 +1,12 @@
 // ===================================================================================
-// ### modules/06_fill_payment_info.js (增加强制重载) ###
+// ### modules/06_fill_payment_info.js (V2 - 移除内部刷新) ###
 // ===================================================================================
 const config = require('../shared/config');
 const { humanLikeType, humanLikeClick, getMonthName } = require('../shared/utils');
 
 async function fillPaymentInfo(page, data) {
-    console.log("[模块6] 准备进入支付信息页面...");
-    // 【重要修正】使用 page.reload() 强制刷新激活页面
-    console.log("[模块6] 正在刷新页面以激活...");
-    await page.reload({ waitUntil: 'networkidle0' });
+    console.log("[模块6] 进入模块，等待并填写支付信息...");
     
-    console.log("[模块6] 等待并填写支付信息...");
     await page.waitForSelector(config.PAYMENT_CARD_NUMBER_SELECTOR, { visible: true, timeout: 180000 });
     await humanLikeType(page, config.PAYMENT_CARD_NUMBER_SELECTOR, data['1step_number']);
     await humanLikeType(page, config.PAYMENT_CARD_HOLDER_NAME_SELECTOR, data.real_name);

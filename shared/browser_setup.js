@@ -1,5 +1,5 @@
 // ===================================================================================
-// ### shared/browser_setup.js (多窗口动态化版) ###
+// ### shared/browser_setup.js (V3 - 更新语言配置) ###
 // ===================================================================================
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -7,10 +7,7 @@ const { openBrowser, closeBrowser, createBrowser, deleteBrowser } = require('../
 puppeteer.use(StealthPlugin());
 
 const FINGERPRINT_OPTIONS = [
-    { coreVersion: '136', os: 'Win32', osVersion: '11', platform: 'Win32' },
-    { coreVersion: '135', os: 'Win32', osVersion: '10', platform: 'Win32' },
-    { coreVersion: '136', os: 'MacIntel', osVersion: '10_15_7', platform: 'MacIntel' },
-    { coreVersion: '134', os: 'Win32', osVersion: '11', platform: 'Win32' },
+    { coreVersion: '136', os: 'Win32', osVersion: '11', platform: 'Win32' }
 ];
 
 async function setupBrowser(instanceId, isHeadless = false, proxyPort, browserIndex) {
@@ -24,7 +21,13 @@ async function setupBrowser(instanceId, isHeadless = false, proxyPort, browserIn
         proxyType: 'socks5',
         host: '127.0.0.1',
         port: proxyPort.toString(),
-        browserFingerPrint: { ...fingerprint, isIpCreateLanguage: true }
+        browserFingerPrint: {
+            ...fingerprint,
+            // 【核心修改】按照您的最新要求更新语言相关配置
+            "isIpCreateLanguage": false,
+            "displayLanguages": "en-US",
+            "languages": "en-US"
+        }
     });
 
     if (!createRes.success) throw new Error(`[${instanceId}] 创建浏览器失败: ${createRes.msg}`);
