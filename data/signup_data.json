@@ -1,0 +1,24 @@
+[
+    {
+    "mailbox": "wBF@qyrcd.com----A2H1rQnQEr7j",
+    "account": "wBF@qyrcd.com",
+    "password": "O9DeaJrAZY6",
+    "1step_number": "4726428476949274",
+    "1step_month": "03",
+    "1step_year": "2027",
+    "1step_code": "229",
+    "2step_number": "5399839225806552",
+    "2step_year": "26",
+    "2step_month": "04",
+    "2step_code": "124",
+    "real_name": "pathuri",
+    "street": "Maj Brings väg, 18",
+    "city": "Sköndal",
+    "state": "Skondal",
+    "postcode": "128 64",
+    "country_full_name": "Sweden",
+    "phone_number_id": "3777240167",
+    "phone_number": "762063577",
+    "phone_number_url": "https:\/\/api.small5.co\/hub\/en\/proxy.php?action=getStatus&id=3777240167&platform=sms"
+}
+]

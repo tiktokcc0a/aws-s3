@@ -1,0 +1,42 @@
+// ===================================================================================
+// ### modules/07_enter_phone_number.js (Cookie处理版) ###
+// ===================================================================================
+const config = require('../shared/config');
+const { humanLikeType, humanLikeClick } = require('../shared/utils');
+
+async function enterPhoneNumber(page, data) {
+    console.log("[模块7] 准备进入手机验证页面...");
+    console.log("[模块7] 正在刷新页面以激活...");
+    await page.reload({ waitUntil: 'networkidle0' });
+    
+    // 【新增】处理Cookie横幅
+    try {
+        const cookieAcceptButtonSelector = 'button[data-id="awsccc-cb-btn-accept"]';
+        console.log('[模块7] 正在检查Cookie横幅...');
+        const acceptButton = await page.waitForSelector(cookieAcceptButtonSelector, { timeout: 5000 });
+        if (acceptButton) {
+            await acceptButton.click();
+            console.log('[模块7] Cookie横幅已点击“Accept”。');
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 等待横幅消失
+        }
+    } catch (error) {
+        console.log('[模块7] 未发现Cookie横幅，或已处理，继续执行...');
+    }
+    
+    console.log("[模块7] 等待并填写身份验证手机号...");
+    await page.waitForSelector(config.IDENTITY_PHONE_NUMBER_SELECTOR, { visible: true, timeout: 180000 });
+
+    await page.click(config.IDENTITY_PHONE_COUNTRY_TRIGGER_SELECTOR);
+
+    await page.waitForSelector(config.IDENTITY_PHONE_DENMARK_OPTION_SELECTOR, { visible: true });
+    await page.click(config.IDENTITY_PHONE_DENMARK_OPTION_SELECTOR);
+
+    await humanLikeType(page, config.IDENTITY_PHONE_NUMBER_SELECTOR, data.phone_number);
+    
+    console.log("[模块7] 准备点击“发送短信”按钮...");
+    await humanLikeClick(page, config.IDENTITY_SEND_SMS_BUTTON_SELECTOR);
+    
+    console.log("[模块7] 手机号提交完毕，主控制器将接管后续流程。");
+}
+
+module.exports = { enterPhoneNumber };
