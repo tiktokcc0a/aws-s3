@@ -1,18 +1,38 @@
 // ===================================================================================
-// ### modules/08_verify_sms.js (最终版 - 已集成弹性等待和多分支判断) ###
+// ### modules/08_verify_sms.js (V2.0 - 增加红窗ES预判) ###
 // ===================================================================================
 const axios = require('axios').default;
-const config =require('../shared/config');
+const config = require('../shared/config');
 const { humanLikeType, humanLikeClick } = require('../shared/utils');
 const { fetchNewPhoneNumber } = require('../shared/api_helper');
 
 async function verifySms(page, data) {
+    console.log("[模块8] 开始执行短信验证模块...");
+
+    // --- 【核心修改】在模块开头加入“红窗ES”预判 ---
+    try {
+        console.log("[模块8] 正在进行“红窗ES”预判 (超时: 6秒)...");
+        const redWindowSelector = 'div[data-analytics-alert="error"] ::-p-text(Sorry, there was an error processing your request)';
+        await page.waitForSelector(redWindowSelector, { visible: true, timeout: 6000 });
+        
+        // 如果上面的waitForSelector没有抛出错误，说明找到了元素
+        console.error("[模块8] 预判成功：检测到“红窗ES”错误！");
+        throw new Error("红窗ES"); // 主动抛出错误，让主控捕获
+
+    } catch (error) {
+        if (error.message === "红窗ES") {
+            // 如果是我们自己抛出的错误，就直接再次抛出
+            throw error;
+        }
+        // 如果是超时错误，说明没找到红窗，这是我们期望的，所以忽略错误，继续执行
+        console.log("[模块8] 预判正常：6秒内未检测到“红窗ES”。");
+    }
+    // --------------------------------------------------
+
     console.log("[模块8] 等待并填写短信验证码...");
 
     try {
         console.log(`[模块8] 正在使用高可靠性方法检测OTP输入框 ('${config.IDENTITY_SMS_PIN_INPUT_SELECTOR}')...`);
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
         await page.waitForFunction(
             (selector) => {
                 const el = document.querySelector(selector);
@@ -48,25 +68,17 @@ async function verifySms(page, data) {
 
     if (!smsCode) {
         console.error("[模块8] 在80秒内未能获取到短信验证码。启动更换手机号流程...");
-        
         try {
-            const countryCode = data.country_code || 'SE'; 
+            const countryCode = data.country_code || 'DE'; 
             const newPhoneInfo = await fetchNewPhoneNumber(countryCode);
-
             data.phone_number_id = newPhoneInfo.phone_number_id;
             data.phone_number = newPhoneInfo.phone_number;
             data.phone_number_url = newPhoneInfo.phone_number_url;
             console.log(`[模块8] 已将当前任务的手机号更新为: ${data.phone_number}`);
-
-            console.log("[模块8] 刷新页面以使用新手机号重新开始验证...");
             await page.reload({ waitUntil: 'networkidle0' });
-            
             throw new Error("PHONE_NUMBER_UPDATED_AND_RELOADED");
-
         } catch (updateError) {
-             if (updateError.message === "PHONE_NUMBER_UPDATED_AND_RELOADED") {
-                throw updateError;
-             }
+             if (updateError.message === "PHONE_NUMBER_UPDATED_AND_RELOADED") throw updateError;
             throw new Error(`[模块8] 更换手机号流程失败: ${updateError.message}`);
         }
     }
@@ -75,29 +87,14 @@ async function verifySms(page, data) {
     await humanLikeClick(page, config.IDENTITY_CONTINUE_BUTTON_SELECTOR);
     console.log("[模块8] 短信验证码提交完毕。");
     
-    // --- 新增逻辑: 启动一个20秒的“快速反应期”来判断后续页面状态 ---
     console.log("[模块8] 进入20秒观察期，并行监控成功或失败标志...");
 
     const timeoutPromise = new Promise(resolve => setTimeout(() => resolve('timeout'), 20000));
+    const successPromise = page.waitForSelector(config.SUPPORT_PLAN_SUBMIT_BUTTON, { visible: true, timeout: 20000 }).then(() => 'success').catch(() => null);
+    const redWindowPromise = page.waitForSelector('div[data-analytics-alert="error"] ::-p-text(Sorry, there was an error processing your request)', { visible: true, timeout: 20000 }).then(() => 'red_window').catch(() => null);
+    const deadCardPromise = page.waitForSelector('div[data-analytics-alert="error"] ::-p-text(There was a problem with your payment information)', { visible: true, timeout: 20000 }).then(() => 'dead_card').catch(() => null);
 
-    const successPromise = page.waitForSelector(config.SUPPORT_PLAN_SUBMIT_BUTTON, { visible: true, timeout: 20000 })
-        .then(() => 'success')
-        .catch(() => null);
-
-    const redWindowPromise = page.waitForSelector('div[data-analytics-alert="error"] ::-p-text(Sorry, there was an error processing your request)', { visible: true, timeout: 20000 })
-        .then(() => 'red_window')
-        .catch(() => null);
-
-    const deadCardPromise = page.waitForSelector('div[data-analytics-alert="error"] ::-p-text(There was a problem with your payment information)', { visible: true, timeout: 20000 })
-        .then(() => 'dead_card')
-        .catch(() => null);
-
-    const outcome = await Promise.race([
-        successPromise,
-        redWindowPromise,
-        deadCardPromise,
-        timeoutPromise
-    ]);
+    const outcome = await Promise.race([ successPromise, redWindowPromise, deadCardPromise, timeoutPromise ]);
 
     switch (outcome) {
         case 'success':
@@ -113,11 +110,9 @@ async function verifySms(page, data) {
             console.log("[模块8] 20秒观察期结束，未检测到明确的成功或失败标志。将返回主循环继续等待。");
             break;
         default:
-            // 如果所有promise都因为没找到元素而返回null（理论上被timeout覆盖，但作为保险）
             console.log("[模块8] 观察期内所有监控均未触发，将返回主循环继续等待。");
             break;
     }
-    // -------------------------------------------------------------
 }
 
 module.exports = { verifySms };

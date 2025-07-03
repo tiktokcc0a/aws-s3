@@ -1,5 +1,5 @@
 // ===================================================================================
-// ### config.js (Continue按钮选择器修复版) ###
+// ### shared/config.js (V5.0 - 动态化改造版) ###
 // ===================================================================================
 
 module.exports = {
@@ -19,7 +19,9 @@ module.exports = {
     // --- 邮箱 API ---
     EMAIL_API_BASE_URL: 'https://mail.32v.us/api/index.php',
 
-    // --- CSS 选择器 (保持您为瑞典配置的版本) ---
+    // ===============================================================================
+    // ### CSS 选择器 (通用部分) ###
+    // ===============================================================================
     EMAIL_INPUT_SELECTOR: '#emailAddress',
     ACCOUNT_NAME_INPUT_SELECTOR: '#accountName',
     CAPTCHA_TRIGGER_SELECTOR: 'button[data-testid="collect-email-submit-button"]',
@@ -37,10 +39,10 @@ module.exports = {
     CREATE_PASSWORD_SUBMIT_SELECTOR: 'button[data-testid="create-password-submit-button"]',
     PERSONAL_ACCOUNT_RADIO_SELECTOR: '#awsui-radio-button-2',
     CONTACT_FULL_NAME_SELECTOR: 'input[name="address.fullName"]',
+    // 触发国家/地区下拉框的按钮是通用的
     CONTACT_PHONE_COUNTRY_TRIGGER_SELECTOR: '#awsui-select-0',
-    CONTACT_PHONE_DENMARK_OPTION_SELECTOR: 'div[data-value="SE"][title="Sweden (+46)"]',
     CONTACT_ADDRESS_COUNTRY_TRIGGER_SELECTOR: '#awsui-select-1',
-    CONTACT_ADDRESS_DENMARK_OPTION_SELECTOR: 'div[data-value="SE"][title="Sweden"]',
+    IDENTITY_PHONE_COUNTRY_TRIGGER_SELECTOR: '#awsui-select-0',
     CONTACT_STREET_SELECTOR: 'input[name="address.addressLine1"]',
     CONTACT_CITY_SELECTOR: 'input[name="address.city"]',
     CONTACT_STATE_SELECTOR: 'input[name="address.state"]',
@@ -53,10 +55,9 @@ module.exports = {
     PAYMENT_CVV_SELECTOR: '#awsui-input-2',
     PAYMENT_MONTH_TRIGGER_SELECTOR: '#awsui-select-1',
     PAYMENT_YEAR_TRIGGER_SELECTOR: '#awsui-select-2',
-    PAYMENT_SUBMIT_BUTTON_SELECTOR: 'button.awsui-button-variant-primary[type="submit"]',
+    // 【核心修改】使用更稳定的文本选择器
+    PAYMENT_SUBMIT_BUTTON_SELECTOR: 'button ::-p-text(Verify and continue (step 3 of 5))',
     PAYMENT_PAGE_FAQ_SELECTOR: 'span.LinkButton_linkButton__eGLo',
-    IDENTITY_PHONE_COUNTRY_TRIGGER_SELECTOR: '#awsui-select-0',
-    IDENTITY_PHONE_DENMARK_OPTION_SELECTOR: 'div[data-value="SE"][title="Sweden (+46)"]',
     IDENTITY_PHONE_NUMBER_SELECTOR: 'input#awsui-input-1',
     IDENTITY_SEND_SMS_BUTTON_SELECTOR: 'button.awsui-button-variant-primary[type="submit"]',
     IDENTITY_CAPTCHA_IMAGE_SELECTOR: 'img[alt="captcha"]',
@@ -64,19 +65,13 @@ module.exports = {
     IDENTITY_CAPTCHA_SUBMIT_SELECTOR: 'button.awsui_button_vjswe_1379u_157.awsui_variant-primary_vjswe_1379u_230[type="submit"]',
     IDENTITY_CAPTCHA_ERROR_SELECTOR: 'div.awsui_error_1i0s3_1goap_185#form-error-\\\:r0\\\:',
     IDENTITY_SMS_PIN_INPUT_SELECTOR: 'input#awsui-input-2',
-    
-    // 【修复】使用更稳定、更官方的Puppeteer文本选择器
     IDENTITY_CONTINUE_BUTTON_SELECTOR: 'button ::-p-text(Continue (step 4 of 5))',
-    
     FINAL_PHONE_VERIFY_COUNTRY_TRIGGER_SELECTOR: 'div[role="button"][aria-haspopup="listbox"]',
     SUPPORT_PLAN_SUBMIT_BUTTON: 'button ::-p-text(Complete sign up)',
     IAM_UNDERSTAND_CHECKBOX: 'input[name="ack-risk"]', 
     IAM_CREATE_KEY_BUTTON: 'button ::-p-text(Create access key)',
-
-    // 【重要修复】更新密钥相关的选择器
-    IAM_SHOW_SECRET_BUTTON: 'strong ::-p-text(Show)', // 新增Show按钮的选择器
-    IAM_ACCESS_KEY_VALUE: 'span[data-testid="inner-text"]', // 更新Access Key的选择器
-    IAM_SECRET_KEY_VALUE: 'span[data-testid="shown-inner-text"]', // 更新Secret Key的选择器
-    
+    IAM_SHOW_SECRET_BUTTON: 'strong ::-p-text(Show)',
+    IAM_ACCESS_KEY_VALUE: 'span[data-testid="inner-text"]',
+    IAM_SECRET_KEY_VALUE: 'span[data-testid="shown-inner-text"]',
     IAM_DOWNLOAD_BUTTON: 'button ::-p-text(Download .csv file)'
 };

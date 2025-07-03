@@ -1,12 +1,12 @@
 // ===================================================================================
-// ### utils/network_watcher.js (新增) ###
+// ### utils/network_watcher.js (V2.0 - 状态旗帜版) ###
 // ===================================================================================
 const axios = require('axios').default;
-const { updatepartial } = require('../request'); // 引入比特浏览器API
 
 class NetworkWatcher {
-    constructor(browserId, instanceId) {
-        this.browserId = browserId;
+    // 【核心修改】构造函数现在接收共享状态对象和实例ID
+    constructor(sharedState, instanceId) {
+        this.sharedState = sharedState;
         this.instanceId = instanceId;
         this.intervalId = null;
         this.isChecking = false;
@@ -15,6 +15,7 @@ class NetworkWatcher {
 
     start() {
         if (this.intervalId) return;
+        // 检查间隔可以按需调整
         this.intervalId = setInterval(() => this.checkNetwork(), 60000);
         console.log(`[网络检测助手 ${this.instanceId}] 已启动，每分钟检测一次网络。`);
     }
@@ -32,35 +33,17 @@ class NetworkWatcher {
         this.isChecking = true;
 
         try {
+            // 使用一个可靠的、低延迟的端点进行网络检查
             await axios.get('https://www.google.com/generate_204', { timeout: 15000 });
         } catch (error) {
             console.warn(`[网络检测助手 ${this.instanceId}] 检测到网络连接超时或失败: ${error.message}`);
-            await this.changeProxyPort();
+            // 【核心修改】不再自己行动，而是升起“网络中断”的旗帜
+            this.sharedState.networkInterrupted = true;
+            console.log(`[网络检测助手 ${this.instanceId}] 已设置网络中断标志，等待主控处理。`);
+            // 一旦检测到失败，可以暂时停止自身，避免在FIX期间重复报警
+            this.stop(); 
         } finally {
             this.isChecking = false;
-        }
-    }
-
-    async changeProxyPort() {
-        const newPort = Math.floor(Math.random() * (45100 - 45050 + 1)) + 45050;
-        console.log(`[网络检测助手 ${this.instanceId}] 准备将代理端口切换至: ${newPort}`);
-
-        try {
-            const res = await updatepartial({
-                id: this.browserId,
-                proxyMethod: 2,
-                proxyType: 'socks5',
-                port: newPort.toString(),
-                host: '127.0.0.1'
-            });
-
-            if (res.success) {
-                console.log(`[网络检测助手 ${this.instanceId}] ✅ 代理端口成功更新为 ${newPort}。`);
-            } else {
-                console.error(`[网络检测助手 ${this.instanceId}] ❌ 通过API更新代理端口失败: ${res.msg}`);
-            }
-        } catch (apiError) {
-            console.error(`[网络检测助手 ${this.instanceId}] ❌ 调用比特浏览器API时发生严重错误: ${apiError.message}`);
         }
     }
 }

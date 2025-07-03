@@ -1,20 +1,24 @@
 // ===================================================================================
-// ### main_controller.js (V7.1 - 并发控制与FIX功能终极整合版) ###
+// ### main_controller.js (V11.2 - 增加待机超时截图) ###
 // ===================================================================================
 const fs = require('fs').promises;
 const path = require('path');
-const axios = require('axios').default; // 【FIX新增】用于FIX流程中的API请求
+const axios = require('axios').default;
 const { setupBrowser, tearDownBrowser } = require('./shared/browser_setup');
-const config = require('./shared/config');
-// NetworkWatcher 您可以根据需要决定是否保留，如果FIX能解决大部分问题，它可以被移除
-// const { NetworkWatcher } = require('./utils/network_watcher'); 
+const staticConfig = require('./shared/config');
+const { NetworkWatcher } = require('./utils/network_watcher');
 
-// 【FIX新增】从命令行参数获取国家代码
+// --- 全局状态与配置 ---
 const args = process.argv.slice(2);
 const countryArg = args.find(arg => arg.startsWith('--country='));
-const COUNTRY_CODE = countryArg ? countryArg.split('=')[1] : 'SE'; // 默认为SE
+const COUNTRY_CODE = countryArg ? countryArg.split('=')[1] : 'SE';
+const pauseState = {};
 
-// --- 模块定义 (与您版本一致) ---
+const KNOWN_FAILURE_MESSAGES = [
+    "出现分区", "死卡", "红窗", "EMAIL_API_TIMEOUT", "REGISTRATION_FAILED_INCOMPLETE", "红窗ES"
+];
+
+// --- 模块与工作流定义 ---
 const modules = {
     '01_fillSignupForm': require('./modules/01_fill_signup_form').fillSignupForm,
     '02_solveCaptcha': require('./modules/02_solve_captcha').solveCaptcha,
@@ -28,8 +32,6 @@ const modules = {
     '9.5_handleConfirmation': require('./modules/9.5_handle_confirmation').handleConfirmation,
     '10_createIamKeys': require('./modules/10_create_iam_keys').createIamKeys,
 };
-
-// --- 工作流定义 (与您版本一致) ---
 const WORKFLOWS = {
     'signup?request_type=register': ['01_fillSignupForm', '02_solveCaptcha', '03_verifyEmail', '04_setPassword'],
     '#/account': ['05_fillContactInfo'],
@@ -40,69 +42,63 @@ const WORKFLOWS = {
     'security_credentials': ['10_createIamKeys']
 };
 
-// 【并发控制】这是您V7.0的核心，予以完全保留
-const MAX_CONCURRENT_SESSIONS = 5; // <--- 在此设置最大并发数
 
-class Semaphore {
-    constructor(permits) {
-        this.permits = permits;
-        this.queue = [];
+// --- 配置生成器 ---
+function generateDynamicConfig(countryCode) {
+    console.log(`[配置生成器] 正在为国家代码 "${countryCode}" 生成动态配置...`);
+    const countryData = require('./shared/combined_country_data.json');
+    const countryInfo = Object.entries(countryData).find(([name, data]) => data.country_code === countryCode);
+    if (!countryInfo) {
+        throw new Error(`无法在 combined_country_data.json 中找到国家代码为 "${countryCode}" 的条目。`);
     }
-    async acquire() {
-        if (this.permits > 0) {
-            this.permits--;
-            return Promise.resolve();
-        }
-        return new Promise(resolve => this.queue.push(resolve));
-    }
-    release() {
-        if (this.queue.length > 0) {
-            this.queue.shift()();
-        } else {
-            this.permits++;
-        }
-    }
+    const [countryName, countryDetails] = countryInfo;
+    const { dialing_code } = countryDetails;
+    const dynamicConfig = {
+        dynamicContactPhoneOptionSelector: `div[data-value="${countryCode}"][title="${countryName} (+${dialing_code})"]`,
+        dynamicContactAddressOptionSelector: `div[data-value="${countryCode}"][title="${countryName}"]`,
+        dynamicIdentityPhoneOptionSelector: `div[data-value="${countryCode}"][title="${countryName} (+${dialing_code})"]`
+    };
+    console.log('[配置生成器] 动态配置生成成功:', dynamicConfig);
+    return dynamicConfig;
 }
-const semaphore = new Semaphore(MAX_CONCURRENT_SESSIONS);
 
 
-/**
- * 【FIX新增】执行FIX流程：更换IP并刷新页面
- */
+// --- 监听来自Python GUI的命令 ---
+process.stdin.on('data', (data) => {
+    const command = data.toString().trim();
+    if (command.startsWith("PAUSE::")) {
+        const instanceId = command.split("::")[1];
+        if (instanceId) pauseState[instanceId] = true;
+        console.log(`[主控] 收到命令: 暂停 ${instanceId}`);
+    } else if (command.startsWith("RESUME::")) {
+        const instanceId = command.split("::")[1];
+        if (instanceId) delete pauseState[instanceId];
+        console.log(`[主控] 收到命令: 恢复 ${instanceId}`);
+    }
+});
+
+
+// --- 核心辅助函数 ---
 async function executeFixProcess(instanceId, port, page, reason) {
     console.log(`[${instanceId} FIX] 触发原因: ${reason}. 开始执行FIX流程...`);
     try {
         console.log(`[${instanceId} FIX] 正在为端口 ${port} 请求更换IP (国家: ${COUNTRY_CODE})...`);
         const response = await axios.post('http://localhost:8080/api/proxy/start', {
-            line: "Line A (AS Route)",
-            country_code: COUNTRY_CODE,
-            start_port: port,
-            count: 1,
-            time: 30
-        }, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 25000 
-        });
-
+            line: "Line A (AS Route)", country_code: COUNTRY_CODE, start_port: port, count: 1, time: 30
+        }, { headers: { 'Content-Type': 'application/json' }, timeout: 25000 });
         console.log(`[${instanceId} FIX] IP更换API响应:`, response.data);
         console.log(`[${instanceId} FIX] IP更换成功，准备刷新页面...`);
         await page.reload({ waitUntil: 'load', timeout: 180000 });
         console.log(`[${instanceId} FIX] 页面刷新成功。FIX流程完成！`);
         return true;
-
     } catch (error) {
         console.error(`[${instanceId} FIX] FIX流程执行失败! 错误: ${error.message}`);
         return false;
     }
 }
-
-// (与您版本一致)
 async function saveFailedCardInfo(data) {
     try {
-        const info = [
-            data['1step_number'], `${data['1step_month']}/${data['1step_year']}`,
-            data['1step_code'], data.real_name
-        ].join('|');
+        const info = [data['1step_number'], `${data['1step_month']}/${data['1step_year']}`, data['1step_code'], data.real_name].join('|');
         const filePath = path.join(__dirname, 'data', 'Not used cards.txt');
         await fs.appendFile(filePath, info + '\n', 'utf-8');
         console.log(`[错误处理] 已将卡信息保存至 ${path.basename(filePath)}`);
@@ -111,197 +107,200 @@ async function saveFailedCardInfo(data) {
     }
 }
 
-// runWorkflow 函数内是FIX逻辑植入的核心区域
-async function runWorkflow(signupData, browserIndex) {
-    const MAX_MODULE_RETRIES = 3; 
+// --- 主工作流函数 ---
+async function runWorkflow(signupData, browserIndex, finalConfig) {
+    const MAX_MODULE_RETRIES = 3;
     const NAVIGATION_TIMEOUT = 180000;
-    const MAX_STANDBY_TIME = 130000; // 【FIX新增】最大待机超时时间 (130秒)
-    const STANDBY_CHECK_INTERVAL = 5000; // 【FIX新增】待机检查间隔 (5秒)
-    
+    const MAX_STANDBY_TIME = 70000;
+    const STANDBY_CHECK_INTERVAL = 5000;
     const PROXY_PORT = 45000 + browserIndex;
     const IS_HEADLESS = process.argv.includes('--headless');
     const instanceId = `W${browserIndex + 1}`;
+    signupData.country_code = COUNTRY_CODE;
+    let page, browserId = null;
+    let networkWatcher = null;
+    const sharedState = { networkInterrupted: false };
 
-    let page;
-    let browserId = null;
-        
-    const workflowState = {};
-    let lastActiveWorkflowKey = null;
-    let standbyTime = 0; // 【FIX新增】待机计时器
+    const reportStatus = (status, details = "") => {
+        const account = signupData.account || 'N/A';
+        console.log(`STATUS_UPDATE::${JSON.stringify({ instanceId, account, status, details: details.substring(0, 150) })}`);
+    };
 
     try {
-        console.log(`\n--- [实例 ${instanceId}] 启动工作流 (端口: ${PROXY_PORT}) ---`);
-        
+        reportStatus("初始化", `启动浏览器，端口: ${PROXY_PORT}...`);
         ({ page, browserId } = await setupBrowser(instanceId, IS_HEADLESS, PROXY_PORT, browserIndex));
-        
+        networkWatcher = new NetworkWatcher(sharedState, instanceId);
+        networkWatcher.start();
+        const workflowState = {};
+        let standbyTime = 0;
         page.on('load', () => {
             const loadedUrl = page.url();
             console.log(`[${instanceId} 事件] 页面加载: ${loadedUrl.substring(0, 80)}...`);
-            for (const urlPart in WORKFLOWS) {
-                if (loadedUrl.includes(urlPart)) {
-                    workflowState[urlPart] = 0;
-                }
-            }
+            for (const urlPart in WORKFLOWS) { if (loadedUrl.includes(urlPart)) { workflowState[urlPart] = 0; } }
         });
-        
-        await page.goto(config.AWS_SIGNUP_URL, { waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
-        lastActiveWorkflowKey = 'signup?request_type=register';
-
+        await page.goto(finalConfig.AWS_SIGNUP_URL, { waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
+        let lastActiveWorkflowKey = 'signup?request_type=register';
         let allWorkflowsComplete = false;
-        
-        mainLoop: while (!allWorkflowsComplete) {
-            // 【FIX修改】将等待时间移到循环开始，并作为待机检测的一部分
-            await new Promise(resolve => setTimeout(resolve, STANDBY_CHECK_INTERVAL));
-            
-            const currentUrl = page.url();
-            if (currentUrl.includes('/signup/incomplete')) {
-                throw new Error("REGISTRATION_FAILED_INCOMPLETE");
-            }
 
+        mainLoop: while (!allWorkflowsComplete) {
+            if (pauseState[instanceId]) {
+                reportStatus("暂停中", "用户手动暂停");
+                while (pauseState[instanceId]) { await new Promise(resolve => setTimeout(resolve, 2000)); }
+                reportStatus("运行中", "已从暂停中恢复...");
+            }
+            if (sharedState.networkInterrupted) {
+                reportStatus("网络中断", "检测到中断，执行FIX...");
+                const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, "网络观察员检测到中断");
+                sharedState.networkInterrupted = false;
+                if(fixSuccess) {
+                    reportStatus("运行中", "网络FIX完成，继续...");
+                    networkWatcher.start();
+                } else { throw new Error(`[${instanceId}] 网络中断后的FIX流程失败。`); }
+            }
+            await new Promise(resolve => setTimeout(resolve, STANDBY_CHECK_INTERVAL));
+            const currentUrl = page.url();
+            if (currentUrl.includes('/signup/incomplete')) { throw new Error("REGISTRATION_FAILED_INCOMPLETE"); }
             let activeWorkflowKey = null;
             for (const urlPart in WORKFLOWS) {
                 const isComplete = (workflowState[urlPart] || 0) >= WORKFLOWS[urlPart].length;
-                if (currentUrl.includes(urlPart) && !isComplete) {
-                    activeWorkflowKey = urlPart;
-                    break;
-                }
+                if (currentUrl.includes(urlPart) && !isComplete) { activeWorkflowKey = urlPart; break; }
             }
 
             if (activeWorkflowKey) {
-                standbyTime = 0; // 【FIX重置】进入活动工作流，重置待机计时器
-
+                standbyTime = 0;
                 if (activeWorkflowKey !== lastActiveWorkflowKey) {
-                    console.log(`[${instanceId} 状态] 检测到工作流切换: 从 '${lastActiveWorkflowKey}' 到 '${activeWorkflowKey}'。强制刷新...`);
+                    reportStatus("切换页面", `从 ${lastActiveWorkflowKey} 到 ${activeWorkflowKey}`);
                     await page.reload({ waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
                     lastActiveWorkflowKey = activeWorkflowKey;
                     continue mainLoop;
                 }
-                
-                const activeWorkflow = WORKFLOWS[activeWorkflowKey];
                 let currentIndex = workflowState[activeWorkflowKey] || 0;
-                const moduleName = activeWorkflow[currentIndex];
+                const moduleName = WORKFLOWS[activeWorkflowKey][currentIndex];
+                if (activeWorkflowKey === 'signup?request_type=register' && moduleName === '02_solveCaptcha') {
+                    console.log(`[主控 ${instanceId}] 进入模块2前置判断...`);
+                    try {
+                        await page.waitForSelector(finalConfig.OTP_INPUT_SELECTOR, { visible: true, timeout: 6000 });
+                        console.log(`[主控 ${instanceId}] 检测到OTP输入框，决定跳过模块2！`);
+                        workflowState[activeWorkflowKey]++;
+                        reportStatus("流程优化", "跳过图形验证码");
+                        continue mainLoop;
+                    } catch (e) {
+                        console.log(`[主控 ${instanceId}] 6秒内未发现OTP输入框，正常执行模块2。`);
+                    }
+                }
                 let moduleRetries = 0;
-
                 while (moduleRetries < MAX_MODULE_RETRIES) {
                     try {
-                        console.log(`\n[${instanceId} 执行] 页面: ${activeWorkflowKey} | 模块: ${moduleName} | (尝试 ${moduleRetries + 1}/${MAX_MODULE_RETRIES})`);
-                        const result = await modules[moduleName](page, signupData);
-                        
+                        reportStatus("运行中", `模块: ${moduleName} (尝试 ${moduleRetries + 1})`);
+                        const result = await modules[moduleName](page, signupData, finalConfig);
                         console.log(`[${instanceId} 成功] 模块 ${moduleName} 执行完毕。`);
                         workflowState[activeWorkflowKey]++;
-                        
                         if (result?.status === 'final_success') allWorkflowsComplete = true;
-                        break; 
-
+                        break;
                     } catch (error) {
                         console.error(`[${instanceId} 失败] 模块 ${moduleName} 第 ${moduleRetries + 1} 次尝试出错: ${error.message.substring(0, 200)}`);
-                        
-                        // 【FIX核心逻辑】判断是否为超时错误，触发FIX流程
+                        reportStatus("错误", `模块 ${moduleName} 出错: ${error.message}`);
                         if (error.message.toLowerCase().includes('timeout')) {
                             const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `模块 ${moduleName} 超时`);
-                            if (fixSuccess) {
-                                console.log(`[${instanceId} 状态] FIX成功，将从主循环重新评估步骤。`);
-                                continue mainLoop;
-                            } else {
-                                throw new Error(`[${instanceId} 最终失败] 模块 ${moduleName} 超时，且FIX流程也失败了。`);
-                            }
+                            if (fixSuccess) { continue mainLoop; } else { throw new Error(`[${instanceId}] 模块 ${moduleName} 超时，且FIX流程也失败了。`); }
                         }
-
-                        // 对于非超时错误，执行原有的重试逻辑 (与您版本一致)
                         moduleRetries++;
-                        if (moduleRetries >= MAX_MODULE_RETRIES) {
-                            throw new Error(`[${instanceId} 最终失败] 模块 ${moduleName} 已达最大重试次数。`);
-                        }
-                        
-                        console.log(`[${instanceId} 重试] (非超时错误) 准备刷新页面后进行第 ${moduleRetries + 1} 次尝试...`);
+                        if (moduleRetries >= MAX_MODULE_RETRIES) { throw new Error(`[${instanceId}] 模块 ${moduleName} 已达最大重试次数。`); }
+                        console.log(`[${instanceId} 重试] (非超时错误) 准备刷新页面...`);
                         try {
                             await page.reload({ waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
-                            console.log(`[${instanceId} 状态] 页面刷新成功，将从主循环重新评估步骤。`);
                             continue mainLoop;
                         } catch (reloadError) {
                             const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `重试时刷新页面超时`);
-                            if (fixSuccess) {
-                                continue mainLoop;
-                            } else {
-                                throw new Error(`[${instanceId} 最终失败] 尝试刷新页面时发生错误，且FIX流程也失败了: ${reloadError.message}`);
-                            }
+                            if (fixSuccess) { continue mainLoop; } else { throw new Error(`[${instanceId}] 尝试刷新页面时发生错误，且FIX流程也失败了。`); }
                         }
                     }
                 }
-            } else { 
-                // 【FIX核心逻辑】处理待机超时 (假死)
+            } else {
                 standbyTime += STANDBY_CHECK_INTERVAL;
-                console.log(`[${instanceId} 待机] 未匹配到任何活动工作流... (已待机 ${standbyTime / 1000}秒)`);
-                
+                reportStatus("待机", `等待页面跳转 (已待机 ${standbyTime / 1000}秒)`);
                 if (standbyTime >= MAX_STANDBY_TIME) {
+                    
+                    // --- 【核心修改】在这里加入截图逻辑 ---
+                    console.log(`[主控 ${instanceId}] 待机超时！正在截取当前页面状态...`);
+                    const screenshotPath = `standby_timeout_screenshot_${instanceId}_${Date.now()}.png`;
+                    try {
+                        await page.screenshot({ path: screenshotPath, fullPage: true });
+                        console.log(`[主控 ${instanceId}] 截图已保存至: ${screenshotPath}`);
+                    } catch (screenshotError) {
+                        console.error(`[主控 ${instanceId}] 截取待机超时截图时失败: ${screenshotError.message}`);
+                    }
+                    // --- 截图逻辑结束 ---
+
                     const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `待机超时 (${standbyTime / 1000}秒)`);
                     if (fixSuccess) {
-                        standbyTime = 0; 
+                        standbyTime = 0;
                         continue mainLoop;
                     } else {
-                         throw new Error(`[${instanceId} 最终失败] 页面待机超时，且FIX流程也失败了。`);
+                        throw new Error(`[${instanceId}] 页面待机超时，且FIX流程也失败了。`);
                     }
                 }
             }
         }
+        reportStatus("成功", "所有工作流执行完毕！");
         console.log(`\n🎉🎉🎉 [${instanceId} 任务完成] 工作流成功！ 🎉🎉🎉`);
+        await tearDownBrowser(browserId);
     } catch (error) {
-        console.error(`\n[${instanceId} 工作流失败] 发生严重错误:`, error.message);
-        if (error.message !== "REGISTRATION_FAILED_INCOMPLETE") {
-            await saveFailedCardInfo(signupData);
+        const errorMessage = error.message;
+        console.error(`\n[${instanceId} 工作流失败] 发生严重错误:`, errorMessage);
+        reportStatus("失败", errorMessage);
+        if (!errorMessage.includes("REGISTRATION_FAILED_INCOMPLETE")) { await saveFailedCardInfo(signupData); }
+        const isKnownFailure = KNOWN_FAILURE_MESSAGES.some(msg => errorMessage.includes(msg));
+        if (isKnownFailure) {
+            console.log(`[${instanceId} 清理] 此为已知的、可预期的失败，将关闭并删除浏览器。`);
+            await tearDownBrowser(browserId);
         } else {
-             console.log(`[${instanceId} 错误处理] 注册不完整，按规则关闭窗口，不保存卡信息。`);
+            console.log(`[${instanceId} 保留] 此为未知的失败，将保留浏览器窗口以供排查。`);
+            if (page) {
+                const screenshotPath = `error_screenshot_${instanceId}_${Date.now()}.png`;
+                try { await page.screenshot({ path: screenshotPath, fullPage: true }); console.log(`[${instanceId}] 截图已保存: ${screenshotPath}`); } catch (e) { /* Ignore */ }
+            }
         }
-        if (page) {
-             const screenshotPath = `error_screenshot_${instanceId}_${Date.now()}.png`;
-             try { await page.screenshot({ path: screenshotPath, fullPage: true }); console.log(`[${instanceId}] 截图已保存: ${screenshotPath}`); } catch (e) {}
-        }
-        // 当此工作流失败时，抛出错误，以便主函数能捕获并标记
         throw new Error(`[${instanceId} 最终失败] 工作流已终止。`);
     } finally {
-        // 不再保留窗口，直接清理
-        await tearDownBrowser(browserId);
-        console.log(`[${instanceId} 清理] 浏览器实例 ${browserId} 已关闭并删除。`);
+        if (networkWatcher) { networkWatcher.stop(); }
     }
 }
 
-// main 函数现在是您V7.0的并发控制版本
+// --- 脚本主入口 ---
 async function main() {
     try {
-        console.log(`准备启动自动化任务... (最大并发数: ${MAX_CONCURRENT_SESSIONS})`);
+        console.log(`准备启动自动化任务... (国家: ${COUNTRY_CODE})`);
+        const dynamicConfig = generateDynamicConfig(COUNTRY_CODE);
+        const finalConfig = { ...staticConfig, ...dynamicConfig };
         const dataContent = await fs.readFile('./data/signup_data.json', 'utf-8');
         const allSignupData = JSON.parse(dataContent);
-
-        if (!allSignupData || allSignupData.length === 0) {
-            console.log("数据文件为空，未启动任何任务。");
-            return;
-        }
-
+        if (!allSignupData || allSignupData.length === 0) { console.log("数据文件为空。"); return; }
         console.log(`从数据文件中加载了 ${allSignupData.length} 个任务。`);
-
-        const workflowPromises = allSignupData.map(async (data, index) => {
-            await semaphore.acquire();
-            console.log(`[并发控制] 信号量已获取，任务 ${index + 1} 开始执行... (剩余许可: ${semaphore.permits})`);
-            try {
-                await runWorkflow(data, index);
-                return { status: 'success', instance: `W${index + 1}` };
-            } catch (err) {
-                console.error(`[main] 捕获到工作流 ${index + 1} 的最终失败: ${err.message}`);
-                return { status: 'failed', instance: `W${index + 1}` }; 
-            } finally {
-                console.log(`[并发控制] 任务 ${index + 1} 执行完毕，释放信号量。`);
-                semaphore.release();
-            }
+        allSignupData.forEach((data, index) => {
+            const instanceId = `W${index + 1}`;
+            const account = data.account || 'N/A';
+            console.log(`STATUS_UPDATE::${JSON.stringify({ instanceId, account, status: "排队中", details: "等待启动..." })}`);
         });
-
+        const workflowPromises = [];
+        for (let i = 0; i < allSignupData.length; i++) {
+            const data = allSignupData[i];
+            const instanceId = `W${i + 1}`;
+            console.log(`[主控] 正在启动任务: ${instanceId}`);
+            const promise = runWorkflow(data, i, finalConfig).catch(err => {
+                console.error(`[主控] 捕获到工作流 ${instanceId} 的最终失败: ${err.message}`);
+                return { status: 'failed', instanceId };
+            });
+            workflowPromises.push(promise);
+            if ((i + 1) % 5 === 0 && (i + 1) < allSignupData.length) {
+                console.log(`[主控] 已启动5个窗口，为减小系统压力，暂停5秒...`);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+        }
+        console.log("[主控] 所有任务均已启动，正在等待它们全部完成...");
         const results = await Promise.all(workflowPromises);
-        const failedCount = results.filter(r => r.status === 'failed').length;
-        const successCount = results.length - failedCount;
-
-        console.log("\n\n[总结] 所有任务均已执行完毕。");
-        console.log(`  - 成功: ${successCount} 个`);
-        console.log(`  - 失败: ${failedCount} 个`);
-
+        const failedCount = results.filter(r => r?.status === 'failed').length;
+        console.log(`\n\n[总结] 所有任务均已执行完毕或终止。成功: ${results.length - failedCount}, 失败: ${failedCount}`);
     } catch (error) {
         console.error("脚本启动时发生致命错误:", error.message);
         process.exit(1);

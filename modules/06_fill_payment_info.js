@@ -1,11 +1,24 @@
 // ===================================================================================
-// ### modules/06_fill_payment_info.js (V2 - 移除内部刷新) ###
+// ### modules/06_fill_payment_info.js (V3.0 - 增加Cookie处理) ###
 // ===================================================================================
-const config = require('../shared/config');
 const { humanLikeType, humanLikeClick, getMonthName } = require('../shared/utils');
 
-async function fillPaymentInfo(page, data) {
+async function fillPaymentInfo(page, data, config) {
     console.log("[模块6] 进入模块，等待并填写支付信息...");
+
+    // 【核心修复】在模块开头加入Cookie横幅处理逻辑
+    try {
+        const cookieAcceptButtonSelector = 'button[data-id="awsccc-cb-btn-accept"]';
+        console.log('[模块6] 正在检查Cookie横幅...');
+        const acceptButton = await page.waitForSelector(cookieAcceptButtonSelector, { timeout: 5000 });
+        if (acceptButton) {
+            await acceptButton.click();
+            console.log('[模块6] Cookie横幅已点击“Accept”。');
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 等待横幅消失
+        }
+    } catch (error) {
+        console.log('[模块6] 未发现Cookie横幅，或已处理，继续执行...');
+    }
     
     await page.waitForSelector(config.PAYMENT_CARD_NUMBER_SELECTOR, { visible: true, timeout: 180000 });
     await humanLikeType(page, config.PAYMENT_CARD_NUMBER_SELECTOR, data['1step_number']);
