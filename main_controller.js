@@ -1,5 +1,5 @@
 // ===================================================================================
-// ### main_controller.js (V18.0 - FINAL - 修复工作流切换FIX漏洞) ###
+// ### main_controller.js (V19.0 - FINAL - 全面健壮性升级) ###
 // ===================================================================================
 const fs = require('fs').promises;
 const path = require('path');
@@ -112,6 +112,18 @@ async function executeFixProcess(instanceId, port, page, reason) {
         }
     } catch (error) {
         console.error(`[${instanceId} FIX] FIX流程执行失败! 错误: ${error.message}`);
+        // 【修改点2】当FIX流程失败时，增加截图功能
+        if (page) {
+            try {
+                const screenshotDir = path.join(__dirname, 'screenshot');
+                await fs.mkdir(screenshotDir, { recursive: true });
+                const screenshotPath = path.join(screenshotDir, `fix_failed_screenshot_${instanceId}_${Date.now()}.png`);
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                console.log(`[${instanceId} FIX] FIX失败截图已保存至: ${screenshotPath}`);
+            } catch (screenshotError) {
+                console.error(`[${instanceId} FIX] 截取FIX失败截图时发生错误: ${screenshotError.message}`);
+            }
+        }
         return false;
     }
 }
@@ -158,8 +170,24 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
 
 
     try {
-        reportStatus("初始化", `启动浏览器，端口: ${PROXY_PORT}...`);
-        ({ page, browserId } = await setupBrowser(instanceId, IS_HEADLESS, PROXY_PORT, browserIndex));
+        // 【修改点3】浏览器启动加入重试逻辑
+        let browserSetupSuccess = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                reportStatus("初始化", `启动浏览器，端口: ${PROXY_PORT} (第 ${attempt}/3 次尝试)`);
+                ({ page, browserId } = await setupBrowser(instanceId, IS_HEADLESS, PROXY_PORT, browserIndex));
+                browserSetupSuccess = true;
+                break; // 成功则跳出循环
+            } catch (error) {
+                console.error(`[${instanceId} 工作流启动失败] 浏览器设置第 ${attempt} 次尝试失败: ${error.message}`);
+                reportStatus("失败", `[${instanceId}] 浏览器启动失败 (尝试 ${attempt}/3): ${error.message}`);
+                if (attempt >= 3) {
+                    throw error; // 重试3次后仍然失败，则抛出最终错误
+                }
+                await new Promise(resolve => setTimeout(resolve, 3000)); // 等待3秒后重试
+            }
+        }
+
         networkWatcher = new NetworkWatcher(sharedState, instanceId);
         networkWatcher.start();
         const workflowState = {};
@@ -182,10 +210,14 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                     reportStatus("错误", `${reason}，执行FIX...`);
                     consecutiveFixes++;
                     if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) {
-                        throw new Error(`初始页面加载连续失败 ${MAX_CONSECUTIVE_FIXES} 次，流程终止。`);
+                        throw new Error(`初始页面加载连续FIX失败 ${MAX_CONSECUTIVE_FIXES} 次，流程终止。`);
                     }
+                    // 【修改点1】即使FIX失败也保持重试
                     const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, reason);
-                    if (!fixSuccess) { throw new Error(`${reason}，且FIX流程也失败了。`); }
+                    if (!fixSuccess) {
+                         console.error(`[${instanceId}] 初始导航的FIX流程执行失败，但这将被计为一次尝试。 (当前连续FIX次数: ${consecutiveFixes})`);
+                         reportStatus("错误", `${reason}，且FIX流程也失败了。将继续尝试...`);
+                    }
                 } else { throw error; }
             }
         }
@@ -214,7 +246,10 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                 if(fixSuccess) {
                     reportStatus("运行中", "网络FIX完成，继续...");
                     networkWatcher.start();
-                } else { throw new Error(`[${instanceId}] 网络中断后的FIX流程失败。`); }
+                } else {
+                    console.error(`[${instanceId}] 网络中断后的FIX流程失败，但这将被计为一次尝试。 (当前连续FIX次数: ${consecutiveFixes})`);
+                    reportStatus("错误", "网络中断FIX失败，将继续尝试...");
+                }
             }
             await new Promise(resolve => setTimeout(resolve, STANDBY_CHECK_INTERVAL));
             const currentUrl = page.url();
@@ -228,7 +263,6 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
             if (activeWorkflowKey) {
                 standbyTime = 0;
 
-                // 【核心BUG修复】为工作流切换时的reload增加FIX机制
                 if (activeWorkflowKey !== lastActiveWorkflowKey) {
                     try {
                         reportStatus("切换页面", `从 ${lastActiveWorkflowKey} 到 ${activeWorkflowKey}`);
@@ -243,11 +277,13 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                                 throw new Error(`切换页面时连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍失败，流程终止。`);
                             }
                             const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, "切换页面时刷新发生网络错误");
-                            if (!fixSuccess) { throw new Error("切换页面时刷新超时，且FIX流程也失败了。"); }
-                            // FIX成功后，重新进入大循环，让它再次判断当前页面
+                            // 【修改点1】即使FIX失败也保持重试
+                            if (!fixSuccess) {
+                                console.error(`[${instanceId}] 页面切换刷新的FIX流程失败，但这将被计为一次尝试。 (当前连续FIX次数: ${consecutiveFixes})`);
+                                reportStatus("错误", "切换页面FIX失败，将继续尝试...");
+                            }
                             continue mainLoop;
                         } else {
-                            // 如果不是可恢复的网络错误，则直接抛出
                             throw error;
                         }
                     }
@@ -291,7 +327,11 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                                 consecutiveFixes++;
                                 if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) { throw new Error(`模块 ${moduleName} 连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍发生网络错误，流程终止。`); }
                                 const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `模块 ${moduleName} 发生网络错误`);
-                                if (!fixSuccess) { throw new Error(`[${instanceId}] 模块 ${moduleName} 发生网络错误，且FIX流程也失败了。`); }
+                                // 【修改点1】即使FIX失败也保持重试
+                                if (!fixSuccess) {
+                                    console.error(`[${instanceId}] 模块错误的FIX流程失败，但这将被计为一次尝试。 (当前连续FIX次数: ${consecutiveFixes})`);
+                                    reportStatus("错误", `模块 ${moduleName} FIX失败，将继续尝试...`);
+                                }
                             }
                             continue mainLoop;
                         }
@@ -307,7 +347,12 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                                 consecutiveFixes++;
                                 if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) { throw new Error(`重试刷新时连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍发生网络错误，流程终止。`); }
                                 const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `重试时刷新页面发生网络错误`);
-                                if (fixSuccess) { continue mainLoop; } else { throw new Error(`[${instanceId}] 尝试刷新页面时发生网络错误，且FIX流程也失败了。`); }
+                                // 【修改点1】即使FIX失败也保持重试
+                                if (!fixSuccess) {
+                                    console.error(`[${instanceId}] 重试刷新页面的FIX流程失败，但这将被计为一次尝试。 (当前连续FIX次数: ${consecutiveFixes})`);
+                                    reportStatus("错误", "重试刷新FIX失败，将继续尝试...");
+                                }
+                                continue mainLoop;
                             } else {
                                 throw reloadError;
                             }
@@ -335,7 +380,10 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                         standbyTime = 0;
                         continue mainLoop;
                     } else {
-                        throw new Error(`[${instanceId}] 页面待机超时，且FIX流程也失败了。`);
+                        // 【修改点1】即使FIX失败也保持重试
+                        console.error(`[${instanceId}] 待机超时的FIX流程失败，但这将被计为一次尝试。 (当前连续FIX次数: ${consecutiveFixes})`);
+                        reportStatus("错误", "待机超时FIX失败，将继续尝试...");
+                        standbyTime = 0; // 重置待机时间，避免立即再次触发
                     }
                 }
             }
@@ -352,7 +400,7 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
             ? KNOWN_FAILURE_MESSAGES.find(msg => errorMessage.includes(msg))
             : errorMessage;
 
-        reportStatus("失败", finalErrorMessage);
+        reportStatus("失败", `[${instanceId}] ` + finalErrorMessage);
 
         if (!errorMessage.includes("REGISTRATION_FAILED_INCOMPLETE")) { await saveFailedCardInfo(signupData); }
         
