@@ -1,5 +1,5 @@
 // ===================================================================================
-// ### modules/10_create_iam_keys.js (V6 - 模块内循环重试版) ###
+// ### modules/10_create_iam_keys.js (V7 - 增加封号判定) ###
 // ===================================================================================
 const fs = require('fs').promises;
 const path = require('path');
@@ -14,15 +14,24 @@ async function createIamKeys(page, data) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         console.log(`[模块10] 第 ${attempt}/${MAX_RETRIES} 次尝试...`);
         try {
-            console.log("[模块10] 开始并行等待关键元素出现...");
-            await Promise.all([
+            console.log("[模块10] 开始并行等待关键元素或封号提示...");
+            
+            // 【新增判定】并行检测封号提示
+            const suspendedPromise = page.waitForSelector("span ::-p-text(Your AWS account was suspended because your account details couldn't be verified.)", { visible: true, timeout: ELEMENT_WAIT_TIMEOUT }).then(() => 'suspended');
+            const elementsPromise = Promise.all([
                 page.waitForSelector(config.IAM_UNDERSTAND_CHECKBOX, { visible: true, timeout: ELEMENT_WAIT_TIMEOUT }),
                 page.waitForSelector(config.IAM_CREATE_KEY_BUTTON, { visible: true, timeout: ELEMENT_WAIT_TIMEOUT })
-            ]);
+            ]).then(() => 'elements_ready');
 
+            const raceResult = await Promise.race([suspendedPromise, elementsPromise]);
+
+            if (raceResult === 'suspended') {
+                console.error("[模块10] 检测到封号提示！");
+                throw new Error("已被封号");
+            }
+            
             console.log("[模块10] 关键元素均已加载，准备执行操作...");
 
-            // 尝试处理新手引导提示框
             try {
                 const nextButtonSelector = 'button.awsui-button-variant-primary[data-testid="aws-onboarding-next-button"]';
                 await page.click(nextButtonSelector, { timeout: 5000 });
@@ -53,10 +62,13 @@ async function createIamKeys(page, data) {
             await fs.writeFile(filePath, contentToSave, 'utf-8');
             console.log(`[模块10] ✅✅✅ 最终成功！账号信息已保存到: ${filePath}`);
 
-            return { status: 'final_success' }; // 成功，跳出函数
+            return { status: 'final_success' };
 
         } catch (error) {
             console.error(`[模块10] 第 ${attempt} 次尝试失败: ${error.message}`);
+            if (error.message.includes("已被封号")) {
+                throw error; // 如果是封号，直接抛出，不再重试
+            }
             if (attempt >= MAX_RETRIES) {
                 throw new Error(`模块10在 ${MAX_RETRIES} 次尝试后仍未成功，最终失败。`);
             }

@@ -1,5 +1,5 @@
 # ===================================================================================
-# ### gui/control_panel.py (V4.1 - 增加邮箱列) ###
+# ### gui/control_panel.py (V5.0 - 升级为选项卡式日志) ###
 # ===================================================================================
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -13,12 +13,14 @@ import queue
 class AwsAutomationApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AWS自动化控制面板 V4.1 (增加邮箱列)")
-        self.root.geometry("950x750") # 再次增加了窗口宽度以容纳新列
+        self.root.title("AWS自动化控制面板 V5.0 (选项卡式日志)")
+        self.root.geometry("950x750")
 
         self.node_process = None
         self.log_queue = queue.Queue()
         self.pause_states = {}
+        # 【核心优化】用于存储每个窗口的日志控件
+        self.log_tabs = {}
 
         # --- 顶部控制区 ---
         top_frame = ttk.Frame(self.root)
@@ -60,7 +62,6 @@ class AwsAutomationApp:
         frame3 = ttk.LabelFrame(self.root, text="第三部分: 窗口实时状态监控", padding=(10, 5))
         frame3.pack(fill="x", padx=10, pady=5)
         
-        # 【核心修改】在列定义中增加 "email"
         self.tree = ttk.Treeview(frame3, columns=("window", "email", "status", "details", "action"), show="headings", height=8)
         self.tree.heading("window", text="窗口名")
         self.tree.heading("email", text="邮箱")
@@ -75,31 +76,47 @@ class AwsAutomationApp:
         self.tree.column("action", width=120, anchor='center')
         
         self.tree.pack(side="left", fill="both", expand=True)
-
         self.tree.bind("<Button-1>", self.on_tree_click)
 
         # --- 第四部分: 原始日志输出 ---
         frame4 = ttk.LabelFrame(self.root, text="第四部分: 原始日志输出", padding=(10, 5))
         frame4.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # 【核心优化】使用Notebook控件代替单一日志框
+        self.notebook = ttk.Notebook(frame4)
+        self.notebook.pack(fill="both", expand=True)
 
-        self.log_text = scrolledtext.ScrolledText(frame4, wrap=tk.WORD, height=10)
-        self.log_text.pack(fill="both", expand=True, side="top")
+        # 创建一个默认的“全部”日志选项卡
+        self.log_all_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.log_all_frame, text='全部日志')
+        self.log_all_text = scrolledtext.ScrolledText(self.log_all_frame, wrap=tk.WORD, height=10)
+        self.log_all_text.pack(fill="both", expand=True)
 
-        self.clear_log_button = ttk.Button(frame4, text="清除日志输出", command=self.clear_logs)
+        self.clear_log_button = ttk.Button(frame4, text="清除所有日志", command=self.clear_logs)
         self.clear_log_button.pack(fill="x", padx=0, pady=5, side="bottom")
 
         self.root.after(100, self.process_log_queue)
 
-    def log(self, message):
-        self.log_text.insert(tk.END, str(message) + '\n')
-        self.log_text.see(tk.END)
+    def log(self, message, instance_id=None):
+        # 始终在“全部日志”中显示
+        self.log_all_text.insert(tk.END, str(message) + '\n')
+        self.log_all_text.see(tk.END)
+        
+        # 如果指定了窗口ID，则在对应的选项卡中也显示
+        if instance_id and instance_id in self.log_tabs:
+            log_widget = self.log_tabs[instance_id]
+            log_widget.insert(tk.END, str(message) + '\n')
+            log_widget.see(tk.END)
 
     def clear_logs(self):
-        self.log_text.delete('1.0', tk.END)
-        self.log("日志已清除。\n")
+        # 【核心优化】清除所有选项卡的日志
+        self.log_all_text.delete('1.0', tk.END)
+        for log_widget in self.log_tabs.values():
+            log_widget.delete('1.0', tk.END)
+        self.log("所有日志已清除。")
 
     def fetch_data_thread(self, url):
-        self.log(f"[GUI] 开始从 {url} 请求全部数据...")
+        self.log_queue.put({"type": "LOG", "payload": f"[GUI] 开始从 {url} 请求全部数据..."})
         try:
             response = requests.get(url, timeout=60)
             response.raise_for_status()
@@ -111,9 +128,9 @@ class AwsAutomationApp:
             os.makedirs(os.path.dirname(data_path), exist_ok=True)
             with open(data_path, 'w', encoding='utf-8') as f:
                 json.dump(data_list, f, indent=4, ensure_ascii=False)
-            self.log(f"[GUI] ✅ 成功！共获取 {len(data_list)} 条数据，已保存至 {os.path.basename(data_path)}")
+            self.log_queue.put({"type": "LOG", "payload": f"[GUI] ✅ 成功！共获取 {len(data_list)} 条数据，已保存至 {os.path.basename(data_path)}"})
         except Exception as e:
-            self.log(f"[GUI] ❌ 请求API数据时出错: {e}")
+            self.log_queue.put({"type": "LOG", "payload": f"[GUI] ❌ 请求API数据时出错: {e}"})
         finally:
             self.log_queue.put({"type": "CONTROL", "payload": "FETCH_DATA_COMPLETE"})
 
@@ -133,6 +150,12 @@ class AwsAutomationApp:
     def start_automation(self):
         self.tree.delete(*self.tree.get_children())
         self.pause_states = {}
+        # 【核心优化】重置日志选项卡
+        for i in self.notebook.tabs():
+            if self.notebook.tab(i, "text") != "全部日志":
+                self.notebook.forget(i)
+        self.log_tabs.clear()
+        
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(script_dir)
         main_script_path = os.path.join(project_root, 'main_controller.js')
@@ -175,34 +198,48 @@ class AwsAutomationApp:
                     continue
 
                 log_message = payload.strip()
+                instance_id = None
+                
+                # 尝试从日志中提取窗口ID
+                if "W" in log_message and (" " in log_message or "]" in log_message):
+                    parts = log_message.replace("[", " ").replace("]", " ").split()
+                    for part in parts:
+                        if part.startswith("W") and part[1:].isdigit():
+                            instance_id = part
+                            break
+                
+                # 【核心优化】动态创建和路由日志
+                if instance_id and instance_id not in self.log_tabs:
+                    new_frame = ttk.Frame(self.notebook)
+                    self.notebook.add(new_frame, text=instance_id)
+                    new_log_text = scrolledtext.ScrolledText(new_frame, wrap=tk.WORD, height=10)
+                    new_log_text.pack(fill="both", expand=True)
+                    self.log_tabs[instance_id] = new_log_text
+                
                 if log_message.startswith("STATUS_UPDATE::"):
                     try:
                         status_data = json.loads(log_message.replace("STATUS_UPDATE::", ""))
                         instance_id = status_data.get("instanceId")
                         if not instance_id: continue
 
-                        # 【核心修改】提取 account 字段作为 email，并构造 values 元组
-                        email = status_data.get("account", "") # 新增
+                        email = status_data.get("account", "")
                         values = (
-                            instance_id,
-                            email,
-                            status_data.get("status", ""),
+                            instance_id, email, status_data.get("status", ""),
                             status_data.get("details", "")
                         )
 
                         if self.tree.exists(instance_id):
-                            # 如果行存在，只更新 email/status/details
                             self.tree.item(instance_id, values=values)
                         else:
-                            # 如果行不存在，则插入新行
                             self.tree.insert("", "end", iid=instance_id, values=values)
                         
                         self.draw_button(instance_id)
-
                     except json.JSONDecodeError:
                         self.log(f"[GUI-ERROR] 无法解析状态消息: {log_message}")
-                elif log_message:
-                    self.log(log_message)
+                
+                if log_message:
+                    # 使用封装的log函数进行输出
+                    self.log(log_message, instance_id)
         except queue.Empty:
             pass
         finally:
@@ -214,7 +251,6 @@ class AwsAutomationApp:
     def on_tree_click(self, event):
         region = self.tree.identify("region", event.x, event.y)
         if region == "cell":
-            # 【核心修改】因为增加了一列，操作列的ID从#4变为#5
             column_id = self.tree.identify_column(event.x)
             if column_id == "#5":
                 item_id = self.tree.identify_row(event.y)
@@ -236,10 +272,10 @@ class AwsAutomationApp:
             self.node_process.stdin.write(command)
             self.node_process.stdin.flush()
             self.pause_states[instance_id] = new_state
-            self.log(f"[GUI] 已发送命令: {command.strip()}")
+            self.log(f"[GUI] 已发送命令: {command.strip()}", instance_id=instance_id)
             self.draw_button(instance_id)
         except Exception as e:
-            self.log(f"[GUI-ERROR] 发送命令失败: {e}")
+            self.log(f"[GUI-ERROR] 发送命令失败: {e}", instance_id=instance_id)
             messagebox.showerror("错误", f"向Node.js进程发送命令失败: {e}")
 
 if __name__ == "__main__":

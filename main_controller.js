@@ -1,5 +1,5 @@
 // ===================================================================================
-// ### main_controller.js (V11.2 - 增加待机超时截图) ###
+// ### main_controller.js (V18.0 - FINAL - 修复工作流切换FIX漏洞) ###
 // ===================================================================================
 const fs = require('fs').promises;
 const path = require('path');
@@ -15,8 +15,22 @@ const COUNTRY_CODE = countryArg ? countryArg.split('=')[1] : 'SE';
 const pauseState = {};
 
 const KNOWN_FAILURE_MESSAGES = [
-    "出现分区", "死卡", "红窗", "EMAIL_API_TIMEOUT", "REGISTRATION_FAILED_INCOMPLETE", "红窗ES"
+    "出现分区", "死卡", "红窗", "EMAIL_API_TIMEOUT", "REGISTRATION_FAILED_INCOMPLETE", "红窗ES",
+    "密码创建服务错误", "已被封号"
 ];
+
+const RECOVERABLE_NETWORK_ERRORS = [
+    'timeout',
+    'err_timed_out',
+    'err_socks_connection_failed',
+    'err_proxy_connection_failed',
+    'err_connection_reset',
+    'err_connection_timed_out',
+    'err_internet_disconnected',
+    'err_address_unreachable',
+    'err_connection_refused'
+];
+
 
 // --- 模块与工作流定义 ---
 const modules = {
@@ -88,9 +102,14 @@ async function executeFixProcess(instanceId, port, page, reason) {
         }, { headers: { 'Content-Type': 'application/json' }, timeout: 25000 });
         console.log(`[${instanceId} FIX] IP更换API响应:`, response.data);
         console.log(`[${instanceId} FIX] IP更换成功，准备刷新页面...`);
-        await page.reload({ waitUntil: 'load', timeout: 180000 });
-        console.log(`[${instanceId} FIX] 页面刷新成功。FIX流程完成！`);
-        return true;
+        try {
+            await page.reload({ waitUntil: 'load', timeout: 120000 }); // Navigation timeout is 120s
+            console.log(`[${instanceId} FIX] 页面刷新成功。FIX流程完成！`);
+            return true;
+        } catch (reloadError) {
+            console.error(`[${instanceId} FIX] 在FIX流程中刷新页面时也超时了: ${reloadError.message}`);
+            return false;
+        }
     } catch (error) {
         console.error(`[${instanceId} FIX] FIX流程执行失败! 错误: ${error.message}`);
         return false;
@@ -110,13 +129,19 @@ async function saveFailedCardInfo(data) {
 // --- 主工作流函数 ---
 async function runWorkflow(signupData, browserIndex, finalConfig) {
     const MAX_MODULE_RETRIES = 3;
-    const NAVIGATION_TIMEOUT = 180000;
+    const NAVIGATION_TIMEOUT = 120000;
+    const START_NAVIGATION_TIMEOUT = 60000;
     const MAX_STANDBY_TIME = 70000;
     const STANDBY_CHECK_INTERVAL = 5000;
     const PROXY_PORT = 45000 + browserIndex;
     const IS_HEADLESS = process.argv.includes('--headless');
     const instanceId = `W${browserIndex + 1}`;
-    signupData.country_code = COUNTRY_CODE;
+    
+    signupData.country_code = finalConfig.countryCode;
+
+    const MAX_CONSECUTIVE_FIXES = 3;
+    let consecutiveFixes = 0;
+
     let page, browserId = null;
     let networkWatcher = null;
     const sharedState = { networkInterrupted: false };
@@ -126,6 +151,12 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
         console.log(`STATUS_UPDATE::${JSON.stringify({ instanceId, account, status, details: details.substring(0, 150) })}`);
     };
 
+    const isRecoverableError = (error) => {
+        const errorMessage = error.message.toLowerCase();
+        return RECOVERABLE_NETWORK_ERRORS.some(errSig => errorMessage.includes(errSig));
+    };
+
+
     try {
         reportStatus("初始化", `启动浏览器，端口: ${PROXY_PORT}...`);
         ({ page, browserId } = await setupBrowser(instanceId, IS_HEADLESS, PROXY_PORT, browserIndex));
@@ -133,14 +164,40 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
         networkWatcher.start();
         const workflowState = {};
         let standbyTime = 0;
+
+        let initialNavigationSuccess = false;
+        while (!initialNavigationSuccess) {
+            try {
+                const navigationPromise = page.goto(finalConfig.AWS_SIGNUP_URL, { waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
+                const watchdogPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('START_NAVIGATION_TIMEOUT')), START_NAVIGATION_TIMEOUT)
+                );
+                
+                await Promise.race([navigationPromise, watchdogPromise]);
+                initialNavigationSuccess = true;
+                
+            } catch (error) {
+                if (isRecoverableError(error) || error.message.includes('START_NAVIGATION_TIMEOUT')) {
+                    const reason = error.message.includes('START_NAVIGATION_TIMEOUT') ? "启动导航超时(60秒)" : "初始页面加载网络错误";
+                    reportStatus("错误", `${reason}，执行FIX...`);
+                    consecutiveFixes++;
+                    if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) {
+                        throw new Error(`初始页面加载连续失败 ${MAX_CONSECUTIVE_FIXES} 次，流程终止。`);
+                    }
+                    const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, reason);
+                    if (!fixSuccess) { throw new Error(`${reason}，且FIX流程也失败了。`); }
+                } else { throw error; }
+            }
+        }
+        consecutiveFixes = 0;
+
+        let lastActiveWorkflowKey = 'signup?request_type=register';
+        let allWorkflowsComplete = false;
         page.on('load', () => {
             const loadedUrl = page.url();
             console.log(`[${instanceId} 事件] 页面加载: ${loadedUrl.substring(0, 80)}...`);
             for (const urlPart in WORKFLOWS) { if (loadedUrl.includes(urlPart)) { workflowState[urlPart] = 0; } }
         });
-        await page.goto(finalConfig.AWS_SIGNUP_URL, { waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
-        let lastActiveWorkflowKey = 'signup?request_type=register';
-        let allWorkflowsComplete = false;
 
         mainLoop: while (!allWorkflowsComplete) {
             if (pauseState[instanceId]) {
@@ -149,6 +206,8 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                 reportStatus("运行中", "已从暂停中恢复...");
             }
             if (sharedState.networkInterrupted) {
+                consecutiveFixes++;
+                if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) { throw new Error(`网络中断连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍无进展，流程终止。`); }
                 reportStatus("网络中断", "检测到中断，执行FIX...");
                 const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, "网络观察员检测到中断");
                 sharedState.networkInterrupted = false;
@@ -168,12 +227,32 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
 
             if (activeWorkflowKey) {
                 standbyTime = 0;
+
+                // 【核心BUG修复】为工作流切换时的reload增加FIX机制
                 if (activeWorkflowKey !== lastActiveWorkflowKey) {
-                    reportStatus("切换页面", `从 ${lastActiveWorkflowKey} 到 ${activeWorkflowKey}`);
-                    await page.reload({ waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
-                    lastActiveWorkflowKey = activeWorkflowKey;
-                    continue mainLoop;
+                    try {
+                        reportStatus("切换页面", `从 ${lastActiveWorkflowKey} 到 ${activeWorkflowKey}`);
+                        await page.reload({ waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
+                        lastActiveWorkflowKey = activeWorkflowKey;
+                        continue mainLoop;
+                    } catch (error) {
+                        if (isRecoverableError(error)) {
+                            reportStatus("错误", "切换页面时刷新超时，执行FIX...");
+                            consecutiveFixes++;
+                            if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) {
+                                throw new Error(`切换页面时连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍失败，流程终止。`);
+                            }
+                            const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, "切换页面时刷新发生网络错误");
+                            if (!fixSuccess) { throw new Error("切换页面时刷新超时，且FIX流程也失败了。"); }
+                            // FIX成功后，重新进入大循环，让它再次判断当前页面
+                            continue mainLoop;
+                        } else {
+                            // 如果不是可恢复的网络错误，则直接抛出
+                            throw error;
+                        }
+                    }
                 }
+                
                 let currentIndex = workflowState[activeWorkflowKey] || 0;
                 const moduleName = WORKFLOWS[activeWorkflowKey][currentIndex];
                 if (activeWorkflowKey === 'signup?request_type=register' && moduleName === '02_solveCaptcha') {
@@ -195,15 +274,28 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                         const result = await modules[moduleName](page, signupData, finalConfig);
                         console.log(`[${instanceId} 成功] 模块 ${moduleName} 执行完毕。`);
                         workflowState[activeWorkflowKey]++;
+                        consecutiveFixes = 0;
                         if (result?.status === 'final_success') allWorkflowsComplete = true;
                         break;
                     } catch (error) {
                         console.error(`[${instanceId} 失败] 模块 ${moduleName} 第 ${moduleRetries + 1} 次尝试出错: ${error.message.substring(0, 200)}`);
                         reportStatus("错误", `模块 ${moduleName} 出错: ${error.message}`);
-                        if (error.message.toLowerCase().includes('timeout')) {
-                            const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `模块 ${moduleName} 超时`);
-                            if (fixSuccess) { continue mainLoop; } else { throw new Error(`[${instanceId}] 模块 ${moduleName} 超时，且FIX流程也失败了。`); }
+                        
+                        const isKnownFailure = KNOWN_FAILURE_MESSAGES.some(msg => error.message.includes(msg));
+                        if (isKnownFailure) {
+                            throw error;
                         }
+                        
+                        if (isRecoverableError(error) || error.message.includes("PHONE_NUMBER_UPDATED_AND_RELOADED")) {
+                            if (!error.message.includes("PHONE_NUMBER_UPDATED_AND_RELOADED")) {
+                                consecutiveFixes++;
+                                if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) { throw new Error(`模块 ${moduleName} 连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍发生网络错误，流程终止。`); }
+                                const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `模块 ${moduleName} 发生网络错误`);
+                                if (!fixSuccess) { throw new Error(`[${instanceId}] 模块 ${moduleName} 发生网络错误，且FIX流程也失败了。`); }
+                            }
+                            continue mainLoop;
+                        }
+                        
                         moduleRetries++;
                         if (moduleRetries >= MAX_MODULE_RETRIES) { throw new Error(`[${instanceId}] 模块 ${moduleName} 已达最大重试次数。`); }
                         console.log(`[${instanceId} 重试] (非超时错误) 准备刷新页面...`);
@@ -211,8 +303,14 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                             await page.reload({ waitUntil: 'load', timeout: NAVIGATION_TIMEOUT });
                             continue mainLoop;
                         } catch (reloadError) {
-                            const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `重试时刷新页面超时`);
-                            if (fixSuccess) { continue mainLoop; } else { throw new Error(`[${instanceId}] 尝试刷新页面时发生错误，且FIX流程也失败了。`); }
+                            if (isRecoverableError(reloadError)) {
+                                consecutiveFixes++;
+                                if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) { throw new Error(`重试刷新时连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍发生网络错误，流程终止。`); }
+                                const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `重试时刷新页面发生网络错误`);
+                                if (fixSuccess) { continue mainLoop; } else { throw new Error(`[${instanceId}] 尝试刷新页面时发生网络错误，且FIX流程也失败了。`); }
+                            } else {
+                                throw reloadError;
+                            }
                         }
                     }
                 }
@@ -220,18 +318,18 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
                 standbyTime += STANDBY_CHECK_INTERVAL;
                 reportStatus("待机", `等待页面跳转 (已待机 ${standbyTime / 1000}秒)`);
                 if (standbyTime >= MAX_STANDBY_TIME) {
-                    
-                    // --- 【核心修改】在这里加入截图逻辑 ---
+                    const screenshotDir = path.join(__dirname, 'screenshot');
+                    await fs.mkdir(screenshotDir, { recursive: true });
+                    const screenshotPath = path.join(screenshotDir, `standby_timeout_screenshot_${instanceId}_${Date.now()}.png`);
                     console.log(`[主控 ${instanceId}] 待机超时！正在截取当前页面状态...`);
-                    const screenshotPath = `standby_timeout_screenshot_${instanceId}_${Date.now()}.png`;
                     try {
                         await page.screenshot({ path: screenshotPath, fullPage: true });
                         console.log(`[主控 ${instanceId}] 截图已保存至: ${screenshotPath}`);
                     } catch (screenshotError) {
                         console.error(`[主控 ${instanceId}] 截取待机超时截图时失败: ${screenshotError.message}`);
                     }
-                    // --- 截图逻辑结束 ---
-
+                    consecutiveFixes++;
+                    if (consecutiveFixes > MAX_CONSECUTIVE_FIXES) { throw new Error(`待机超时连续FIX ${MAX_CONSECUTIVE_FIXES} 次后仍无进展，流程终止。`); }
                     const fixSuccess = await executeFixProcess(instanceId, PROXY_PORT, page, `待机超时 (${standbyTime / 1000}秒)`);
                     if (fixSuccess) {
                         standbyTime = 0;
@@ -248,16 +346,25 @@ async function runWorkflow(signupData, browserIndex, finalConfig) {
     } catch (error) {
         const errorMessage = error.message;
         console.error(`\n[${instanceId} 工作流失败] 发生严重错误:`, errorMessage);
-        reportStatus("失败", errorMessage);
-        if (!errorMessage.includes("REGISTRATION_FAILED_INCOMPLETE")) { await saveFailedCardInfo(signupData); }
+        
         const isKnownFailure = KNOWN_FAILURE_MESSAGES.some(msg => errorMessage.includes(msg));
+        const finalErrorMessage = isKnownFailure 
+            ? KNOWN_FAILURE_MESSAGES.find(msg => errorMessage.includes(msg))
+            : errorMessage;
+
+        reportStatus("失败", finalErrorMessage);
+
+        if (!errorMessage.includes("REGISTRATION_FAILED_INCOMPLETE")) { await saveFailedCardInfo(signupData); }
+        
         if (isKnownFailure) {
-            console.log(`[${instanceId} 清理] 此为已知的、可预期的失败，将关闭并删除浏览器。`);
+            console.log(`[${instanceId} 清理] 此为已知的、可预期的失败 (${finalErrorMessage})，将关闭并删除浏览器。`);
             await tearDownBrowser(browserId);
         } else {
             console.log(`[${instanceId} 保留] 此为未知的失败，将保留浏览器窗口以供排查。`);
             if (page) {
-                const screenshotPath = `error_screenshot_${instanceId}_${Date.now()}.png`;
+                const screenshotDir = path.join(__dirname, 'screenshot');
+                await fs.mkdir(screenshotDir, { recursive: true });
+                const screenshotPath = path.join(screenshotDir, `error_screenshot_${instanceId}_${Date.now()}.png`);
                 try { await page.screenshot({ path: screenshotPath, fullPage: true }); console.log(`[${instanceId}] 截图已保存: ${screenshotPath}`); } catch (e) { /* Ignore */ }
             }
         }
@@ -272,7 +379,8 @@ async function main() {
     try {
         console.log(`准备启动自动化任务... (国家: ${COUNTRY_CODE})`);
         const dynamicConfig = generateDynamicConfig(COUNTRY_CODE);
-        const finalConfig = { ...staticConfig, ...dynamicConfig };
+        const finalConfig = { ...staticConfig, ...dynamicConfig, countryCode: COUNTRY_CODE };
+        
         const dataContent = await fs.readFile('./data/signup_data.json', 'utf-8');
         const allSignupData = JSON.parse(dataContent);
         if (!allSignupData || allSignupData.length === 0) { console.log("数据文件为空。"); return; }
